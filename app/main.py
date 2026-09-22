@@ -153,7 +153,7 @@ def import_log(bid: int, file: UploadFile = File(...)):
         except CsvFormatError as exc:
             raise HTTPException(422, f"CSV 解析失败: {exc}")
 
-        cycles = detect_cycles(samples)
+        cycles = detect_cycles(samples, cell_count=meta.get("cell_count"))
         for cyc in cycles:
             cyc.flags = evaluate_cycle(
                 cyc, battery["rated_capacity_ah"],
@@ -162,15 +162,24 @@ def import_log(bid: int, file: UploadFile = File(...)):
         cur = conn.execute(
             "INSERT INTO logs(battery_id, filename, imported_at, start_time,"
             " duration_s, row_count, max_current_a, min_voltage, max_voltage,"
-            " max_temp_c) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            " max_temp_c, cell_count, cell_columns, cell_rows_used,"
+            " cell_rows_skipped, cell_skip_reasons, cell_problems)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (bid, file.filename or "upload.csv", _now_iso(), meta["start_time"],
              meta["duration_s"], meta["row_count"], meta["max_current_a"],
-             meta["min_voltage"], meta["max_voltage"], meta["max_temp_c"]))
+             meta["min_voltage"], meta["max_voltage"], meta["max_temp_c"],
+             meta["cell_count"],
+             json.dumps(meta["cell_columns"], ensure_ascii=False),
+             meta["cell_rows_used"], meta["cell_rows_skipped"],
+             json.dumps(meta["cell_skip_reasons"], ensure_ascii=False),
+             json.dumps(meta["cell_problems"], ensure_ascii=False)))
         log_id = cur.lastrowid
         conn.executemany(
-            "INSERT INTO samples(log_id, t, voltage, current, temperature)"
-            " VALUES(?,?,?,?,?)",
-            [(log_id, s.t, s.v, s.i, s.temp) for s in samples])
+            "INSERT INTO samples(log_id, t, voltage, current, temperature,"
+            " cell_voltages) VALUES(?,?,?,?,?,?)",
+            [(log_id, s.t, s.v, s.i, s.temp,
+              json.dumps(s.cells) if s.cells is not None else None)
+             for s in samples])
         start_epoch = None
         if meta["start_time"]:
             start_epoch = datetime.fromisoformat(
@@ -183,18 +192,29 @@ def import_log(bid: int, file: UploadFile = File(...)):
                 "INSERT INTO cycles(log_id, battery_id, seq, kind, start_t,"
                 " end_t, start_iso, duration_s, capacity_ah, energy_wh,"
                 " avg_current_a, min_voltage, max_voltage, max_temp_c,"
-                " temp_rise_c, ir_mohm, closed, flags)"
-                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                " temp_rise_c, ir_mohm, closed, flags, cell_count,"
+                " cell_rows_used, cell_rows_skipped, max_cell_spread_v,"
+                " over_threshold_s, cell_intervals)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (log_id, bid, cyc.seq, cyc.kind, cyc.start_t, cyc.end_t,
                  start_iso, cyc.duration_s, cyc.capacity_ah, cyc.energy_wh,
                  cyc.avg_current_a, cyc.min_voltage, cyc.max_voltage,
                  cyc.max_temp_c, cyc.temp_rise_c, cyc.ir_mohm,
                  1 if cyc.closed else 0, json.dumps(cyc.flags,
-                                                    ensure_ascii=False)))
+                                                    ensure_ascii=False),
+                 cyc.cell_count, cyc.cell_rows_used, cyc.cell_rows_skipped,
+                 cyc.max_cell_spread_v, cyc.over_threshold_s,
+                 json.dumps(cyc.cell_intervals, ensure_ascii=False)))
         conn.commit()
         log = dict(conn.execute("SELECT * FROM logs WHERE id=?",
                                 (log_id,)).fetchone())
         return {"log": log, "skipped_rows": meta["skipped_rows"],
+                "cell_count": meta["cell_count"],
+                "cell_columns": meta["cell_columns"],
+                "cell_rows_used": meta["cell_rows_used"],
+                "cell_rows_skipped": meta["cell_rows_skipped"],
+                "cell_skip_reasons": meta["cell_skip_reasons"],
+                "cell_problems": meta["cell_problems"],
                 "cycles": [c.to_dict() for c in cycles]}
     finally:
         conn.close()
@@ -224,19 +244,28 @@ def get_log(log_id: int, max_points: int = 3000):
         log = conn.execute("SELECT * FROM logs WHERE id=?", (log_id,)).fetchone()
         if log is None:
             raise HTTPException(404, f"日志 {log_id} 不存在")
+        log = dict(log)
+        for key in ("cell_columns", "cell_skip_reasons", "cell_problems"):
+            if log.get(key):
+                log[key] = json.loads(log[key])
         rows = conn.execute(
-            "SELECT t, voltage, current, temperature FROM samples"
-            " WHERE log_id=? ORDER BY t", (log_id,)).fetchall()
+            "SELECT t, voltage, current, temperature, cell_voltages"
+            " FROM samples WHERE log_id=? ORDER BY t", (log_id,)).fetchall()
         stride = max(1, len(rows) // max_points + (1 if len(rows) % max_points else 0))
-        samples = [[round(r["t"], 2), r["voltage"], r["current"], r["temperature"]]
-                   for r in rows[::stride]]
+        samples = []
+        for r in rows[::stride]:
+            samples.append([
+                round(r["t"], 2), r["voltage"], r["current"], r["temperature"],
+                json.loads(r["cell_voltages"]) if r["cell_voltages"] else None,
+            ])
         cycles = [dict(r) for r in conn.execute(
             "SELECT * FROM cycles WHERE log_id=? ORDER BY seq",
             (log_id,)).fetchall()]
         for c in cycles:
             c["flags"] = json.loads(c["flags"])
             c["closed"] = bool(c["closed"])
-        return {"log": dict(log), "samples": samples, "cycles": cycles}
+            c["cell_intervals"] = json.loads(c.get("cell_intervals") or "[]")
+        return {"log": log, "samples": samples, "cycles": cycles}
     finally:
         conn.close()
 
@@ -264,6 +293,7 @@ def _build_battery_assessment(conn, bid: int) -> dict:
         c = dict(r)
         c["flags"] = json.loads(c["flags"])
         c["closed"] = bool(c["closed"])
+        c["cell_intervals"] = json.loads(c.get("cell_intervals") or "[]")
         cycles.append(c)
     log_count = conn.execute(
         "SELECT COUNT(*) AS n FROM logs WHERE battery_id=?", (bid,)).fetchone()["n"]

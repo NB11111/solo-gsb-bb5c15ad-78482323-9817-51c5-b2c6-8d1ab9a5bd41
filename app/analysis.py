@@ -22,6 +22,9 @@ TEMP_CRIT_C = 60.0           # 温度严重告警 (°C)
 TEMP_RISE_WARN_C = 15.0      # 单循环温升告警 (°C)
 VOLT_MARGIN_V = 0.02         # 电压越限判定余量 (V)
 OVER_CAPACITY_RATIO = 1.10   # 放电容量超过额定该比例时提示额定容量可能偏低
+CELL_SPREAD_THRESHOLD_V = 0.10  # 单体压差（最高-最低）超差阈值 (V)
+CELL_SPREAD_MIN_S = 5.0         # 压差连续超差达该时长才判定单体失衡 (s)
+CELL_SAMPLE_GAP_S = 2.0         # 相邻采样点间隔超过该值则中断连续区间 (s)
 
 
 class Sample(NamedTuple):
@@ -29,6 +32,7 @@ class Sample(NamedTuple):
     v: float      # 电压 V
     i: float      # 电流 A，正=放电，负=充电
     temp: float   # 温度 °C
+    cells: Optional[tuple[float, ...]] = None  # 各单体电压 V（可选列）
 
 
 @dataclass
@@ -48,6 +52,13 @@ class Cycle:
     ir_mohm: Optional[float]
     closed: bool
     flags: list = field(default_factory=list)
+    # ---- 单体（cell）电压分析；日志无单体列时以下字段为 None/空 ----
+    cell_count: Optional[int] = None
+    cell_rows_used: int = 0
+    cell_rows_skipped: int = 0
+    max_cell_spread_v: Optional[float] = None   # 循环内最大单体压差
+    over_threshold_s: Optional[float] = None    # 压差超过阈值的累计时长
+    cell_intervals: list = field(default_factory=list)  # 持续超差区间（含证据片段）
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -57,6 +68,14 @@ class Cycle:
             d[k] = round(d[k], 4)
         if d["ir_mohm"] is not None:
             d["ir_mohm"] = round(d["ir_mohm"], 2)
+        if d["max_cell_spread_v"] is not None:
+            d["max_cell_spread_v"] = round(d["max_cell_spread_v"], 4)
+        if d["over_threshold_s"] is not None:
+            d["over_threshold_s"] = round(d["over_threshold_s"], 3)
+        for iv in d["cell_intervals"]:
+            for k in ("start_t", "end_t", "duration_s", "max_spread_v",
+                      "at_max_t"):
+                iv[k] = round(iv[k], 3)
         return d
 
 
@@ -162,13 +181,105 @@ def _estimate_ir(samples: list[Sample], a: int, b: int,
     return sum(ests) / len(ests) if ests else None
 
 
+def analyze_cell_spread(samples: list[Sample], a: int, b: int,
+                        cell_count: int) -> dict:
+    """按时间连续性分析一段（循环）内的单体压差。
+
+    - 压差 = 同一样本行内 max(cell) - min(cell)，同一行按编号成组解析，
+      缺值/单体数漂移的行在导入阶段已剔除（s.cells 为 None）。
+    - 压差连续超过 CELL_SPREAD_THRESHOLD_V 达 CELL_SPREAD_MIN_S 秒才计为
+      一个持续超差区间；采样间隔不规则时按时间戳累计时长。
+    - 相邻有效采样点间隔超过 CELL_SAMPLE_GAP_S（含缺值行造成的断点）时
+      中断连续区间，断点两侧不拼接。
+
+    返回最大压差、超差累计时长与区间列表（含证据片段）。
+    """
+    pts: list[tuple[float, float, tuple[float, ...]]] = []
+    for k in range(a, b + 1):
+        s = samples[k]
+        if s.cells is not None and len(s.cells) == cell_count:
+            pts.append((s.t, max(s.cells) - min(s.cells), s.cells))
+
+    max_spread: Optional[float] = None
+    at_max_t: Optional[float] = None
+    intervals: list[dict] = []
+    over_total = 0.0
+
+    run: list[tuple[float, float, tuple[float, ...]]] = []
+
+    def close_run(run_pts, end_reason: str):
+        nonlocal over_total
+        if not run_pts:
+            return
+        # 时长按时间戳累计（区间内相邻点 dt 之和），不规则采样同样适用
+        dur = sum(run_pts[k + 1][0] - run_pts[k][0]
+                  for k in range(len(run_pts) - 1))
+        over_total += dur
+        if dur < CELL_SPREAD_MIN_S:
+            return  # 短暂尖峰：不生成区间、不告警
+        mk = max(range(len(run_pts)), key=lambda j: run_pts[j][1])
+        st, _, cells_st = run_pts[0]
+        et, sp_et, cells_et = run_pts[-1]
+        mt, ms, cells_mt = run_pts[mk]
+        if end_reason == "gap":
+            tail = (f"t={et:.1f}s 后出现超过 {CELL_SAMPLE_GAP_S:.0f}s "
+                    f"的采样断点，连续区间中断")
+        elif end_reason == "cycle_end":
+            tail = f"直至 t={et:.1f}s 循环结束压差仍为 {sp_et:.3f}V"
+        else:
+            tail = f"t={et:.1f}s 回落至 {sp_et:.3f}V"
+        intervals.append({
+            "start_t": st,
+            "end_t": et,
+            "duration_s": dur,
+            "end_reason": end_reason,
+            "max_spread_v": ms,
+            "at_max_t": mt,
+            "evidence": (
+                f"t={st:.1f}s 起压差 {run_pts[0][1]:.3f}V；"
+                f"t={mt:.1f}s 最大压差 {ms:.3f}V"
+                f"（最高单体 {max(cells_mt):.3f}V / 最低 {min(cells_mt):.3f}V）；"
+                f"{tail}；连续 {dur:.1f}s > {CELL_SPREAD_THRESHOLD_V:.2f}V"
+            ),
+            "cells_start": [round(v, 3) for v in cells_st],
+            "cells_at_max": [round(v, 3) for v in cells_mt],
+            "cells_end": [round(v, 3) for v in cells_et],
+        })
+
+    prev_t: Optional[float] = None
+    for pt in pts:
+        t, spread, _ = pt
+        if max_spread is None or spread > max_spread:
+            max_spread, at_max_t = spread, t
+        broken = prev_t is not None and (t - prev_t) > CELL_SAMPLE_GAP_S
+        over = spread > CELL_SPREAD_THRESHOLD_V
+        if broken or not over:
+            close_run(run, "gap" if broken else "recovered")
+            run = []
+        if over and not broken:
+            run.append(pt)
+        prev_t = t
+    close_run(run, "cycle_end")
+
+    return {
+        "cell_rows_used": len(pts),
+        "max_cell_spread_v": max_spread,
+        "max_spread_t": at_max_t,
+        "over_threshold_s": over_total if pts else None,
+        "cell_intervals": intervals,
+    }
+
+
 def _build_cycle(samples: list[Sample], a: int, b: int,
-                 kind: str, thr: float) -> Cycle:
+                 kind: str, thr: float, cell_count: Optional[int]) -> Cycle:
     seg = samples[a:b + 1]
     cap_ah, energy_wh = _integrate(samples, a, b)
     duration = samples[b].t - samples[a].t
     ir = _estimate_ir(samples, a, b, kind, thr)
     max_temp = max(s.temp for s in seg)
+    n_skip = sum(1 for s in seg if cell_count and s.cells is None)
+    cell_info = (analyze_cell_spread(samples, a, b, cell_count)
+                 if cell_count else None)
     return Cycle(
         seq=0,
         kind="discharge" if kind == "D" else "charge",
@@ -184,13 +295,22 @@ def _build_cycle(samples: list[Sample], a: int, b: int,
         temp_rise_c=max_temp - seg[0].temp,
         ir_mohm=(ir * 1000.0) if ir is not None else None,
         closed=True,
+        cell_count=cell_count,
+        cell_rows_skipped=n_skip,
+        cell_rows_used=cell_info["cell_rows_used"] if cell_info else 0,
+        max_cell_spread_v=(cell_info["max_cell_spread_v"]
+                           if cell_info else None),
+        over_threshold_s=(cell_info["over_threshold_s"]
+                          if cell_info else None),
+        cell_intervals=cell_info["cell_intervals"] if cell_info else [],
     )
 
 
 def detect_cycles(samples: list[Sample],
                   min_cycle_s: float = MIN_CYCLE_S,
                   min_rest_s: float = MIN_REST_S,
-                  rest_current_a: Optional[float] = None) -> list[Cycle]:
+                  rest_current_a: Optional[float] = None,
+                  cell_count: Optional[int] = None) -> list[Cycle]:
     """状态机主入口：样本序列 -> 循环列表。"""
     if len(samples) < 2:
         return []
@@ -203,7 +323,7 @@ def detect_cycles(samples: list[Sample],
     for si, (kind, a, b) in enumerate(segs):
         if kind == "R":
             continue
-        cyc = _build_cycle(samples, a, b, kind, thr)
+        cyc = _build_cycle(samples, a, b, kind, thr, cell_count)
         cyc.seq = len(cycles) + 1
         cyc.closed = si < len(segs) - 1   # 日志结束时仍处于充/放电 -> 未闭合
         cycles.append(cyc)
@@ -268,6 +388,18 @@ def evaluate_cycle(cyc: Cycle, rated_ah: float,
                        f"{TEMP_RISE_WARN_C:.0f}°C，发热异常。",
             "evidence": f"temp_rise={cyc.temp_rise_c:.1f}°C",
         })
+    # 单体失衡：要求压差连续超差达 MIN_S（短尖峰不告警，采样断点不拼接）
+    if cyc.cell_intervals:
+        longest = max(cyc.cell_intervals, key=lambda iv: iv["duration_s"])
+        flags.append({
+            "code": "CELL_IMBALANCE", "severity": "warning",
+            "message": f"{where}单体最大压差 {cyc.max_cell_spread_v:.3f}V，"
+                       f"其中 {len(cyc.cell_intervals)} 个区间压差连续超过 "
+                       f"{CELL_SPREAD_THRESHOLD_V:.2f}V（最长 "
+                       f"{longest['duration_s']:.1f}s，阈值 "
+                       f"{CELL_SPREAD_MIN_S:.0f}s），存在单体失衡。",
+            "evidence": longest["evidence"],
+        })
     return flags
 
 
@@ -330,6 +462,12 @@ def build_assessment(battery: dict, cycles: list[dict], log_count: int) -> dict:
     irs = [c["ir_mohm"] for c in cycles if c.get("ir_mohm") is not None]
     avg_ir = sum(irs) / len(irs) if irs else None
     max_temp = max((c["max_temp_c"] for c in cycles), default=None)
+    cell_logs = {c["log_id"] for c in cycles if c.get("cell_count")}
+    cell_cycles = [c for c in cycles if c.get("cell_count")]
+    imbalance_cycles = [c for c in cell_cycles if c.get("cell_intervals")]
+    max_cell_spread = max((c["max_cell_spread_v"] for c in cell_cycles
+                           if c.get("max_cell_spread_v") is not None),
+                          default=None)
 
     # 4) 健康等级
     rank = {"info": 0, "warning": 1, "critical": 2}
@@ -348,7 +486,9 @@ def build_assessment(battery: dict, cycles: list[dict], log_count: int) -> dict:
     trend = [{"n": i + 1, "capacity_ah": round(c["capacity_ah"], 4),
               "log_id": c["log_id"], "cycle_seq": c["seq"],
               "start_iso": c.get("start_iso"), "ir_mohm": c.get("ir_mohm"),
-              "max_temp_c": c["max_temp_c"]}
+              "max_temp_c": c["max_temp_c"],
+              "max_cell_spread_v": c.get("max_cell_spread_v"),
+              "cell_imbalance": bool(c.get("cell_intervals"))}
              for i, c in enumerate(dis)]
 
     parts = [
@@ -364,6 +504,12 @@ def build_assessment(battery: dict, cycles: list[dict], log_count: int) -> dict:
         parts.append(f"平均估算内阻 {avg_ir:.1f}mΩ。")
     if max_temp is not None:
         parts.append(f"历史最高温度 {max_temp:.1f}°C。")
+    if cell_logs:
+        parts.append(
+            f"单体电压分析覆盖 {len(cell_logs)} 份日志中的 {len(cell_cycles)} 个循环，"
+            f"{len(imbalance_cycles)} 个循环检出单体失衡"
+            + (f"，历史最大单体压差 {max_cell_spread:.3f}V。"
+               if max_cell_spread is not None else "。"))
     n_crit = sum(1 for f in flags if f["severity"] == "critical")
     n_warn = sum(1 for f in flags if f["severity"] == "warning")
     parts.append(f"判定标记：严重 {n_crit} 条、警告 {n_warn} 条；综合健康等级：{GRADE_LABELS[grade]}。")
@@ -382,6 +528,11 @@ def build_assessment(battery: dict, cycles: list[dict], log_count: int) -> dict:
             "fade_per_cycle_percent": round(fade_rate, 3),
             "avg_ir_mohm": round(avg_ir, 2) if avg_ir is not None else None,
             "max_temp_c": max_temp,
+            "cell_monitored_logs": len(cell_logs),
+            "cell_monitored_cycles": len(cell_cycles),
+            "cell_imbalance_cycles": len(imbalance_cycles),
+            "max_cell_spread_v": (round(max_cell_spread, 4)
+                                  if max_cell_spread is not None else None),
             "health_grade": grade,
             "health_label": GRADE_LABELS[grade],
         },
