@@ -149,9 +149,26 @@ $("#btn-upload").onclick = async () => {
       { method: "POST", body: fd });
     const dis = r.cycles.filter((c) => c.kind === "discharge").length;
     const chg = r.cycles.length - dis;
-    $("#upload-result").textContent =
+    let msg =
       `导入成功：${r.log.row_count} 行样本，识别放电循环 ${dis} 个、充电循环 ${chg} 个` +
       (r.skipped_rows ? `，跳过无效行 ${r.skipped_rows} 行` : "") + "。";
+    if (r.cells && r.cells.present) {
+      if (r.cells.enabled) {
+        msg += `识别单体电压列 ${r.cells.cell_count} 个，参与单体分析 ${r.cells.rows_with_cells} 行`;
+        if (r.cells.rows_skipped) {
+          const reasons = Object.entries(r.cells.skip_reasons)
+            .map(([why, rec]) => `${why} ${rec.count} 行（如第 ${rec.rows.join("、")} 行）`)
+            .join("；");
+          msg += `；${r.cells.rows_skipped} 行跳过单体分析（${reasons}）`;
+        }
+        const imbalanced = r.cycles.filter((c) =>
+          c.flags.some((f) => f.code === "CELL_IMBALANCE")).length;
+        msg += imbalanced ? `；单体失衡告警循环 ${imbalanced} 个。` : "；未发现持续单体失衡。";
+      } else {
+        msg += `识别到单体列但未启用单体分析（${r.cells.disabled_reason}）。`;
+      }
+    }
+    $("#upload-result").textContent = msg;
     input.value = "";
     await Promise.all([loadAssessment(), loadLogs(), loadBatteries(true)]);
   } catch (err) {
@@ -212,6 +229,10 @@ async function loadAssessment() {
     ["每循环衰减", fmt(s.fade_per_cycle_percent, 2) + "%", ""],
     ["平均内阻", s.avg_ir_mohm !== null ? fmt(s.avg_ir_mohm, 1) + " mΩ" : "—", ""],
     ["历史最高温度", s.max_temp_c !== null ? fmt(s.max_temp_c, 1) + " °C" : "—", ""],
+    ["单体最大压差", s.cell_worst_diff_v !== null
+      ? fmt(s.cell_worst_diff_v, 3) + " V"
+      + (s.cell_imbalance_cycles ? `（${s.cell_imbalance_cycles} 段失衡）` : "")
+      : "—", s.cell_imbalance_cycles ? "fair" : ""],
     ["放电 / 充电循环", `${s.discharge_cycles} / ${s.charge_cycles}`, ""],
   ];
   $("#summary-cards").innerHTML = cards.map(([k, v, cls]) =>
@@ -262,6 +283,10 @@ function renderCyclesTable(cycles) {
       : `<span class="tag open">未闭合</span>`;
     const flagTxt = c.flags.length
       ? ` ⚠ ${c.flags.map((f) => f.code).join(", ")}` : "";
+    const cellTxt = c.cell_count
+      ? `${c.cell_count} 节 · ${fmt(c.cell_max_diff_v, 3)}V` +
+        (c.cell_sustain_s > 0 ? ` · ${fmt(c.cell_sustain_s, 0)}s` : "")
+      : "—";
     tr.innerHTML = `<td>${c.seq}</td><td>${kindTag}</td>
       <td>${c.start_iso ? fmtTime(c.start_iso) : fmt(c.start_t, 0) + "s"}</td>
       <td>${fmtDur(c.duration_s)}</td><td>${fmt(c.capacity_ah, 3)}</td>
@@ -269,11 +294,12 @@ function renderCyclesTable(cycles) {
       <td>${fmt(c.min_voltage)} ~ ${fmt(c.max_voltage)}</td>
       <td>${fmt(c.max_temp_c, 1)}</td><td>${fmt(c.temp_rise_c, 1)}</td>
       <td>${c.ir_mohm !== null ? fmt(c.ir_mohm, 1) : "—"}</td>
+      <td>${cellTxt}</td>
       <td>${stateTag}${flagTxt}</td>`;
     tbody.appendChild(tr);
   }
   if (!cycles.length) {
-    tbody.innerHTML = `<tr><td colspan="12" class="muted">未识别到完整充放电循环。</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="13" class="muted">未识别到完整充放电循环。</td></tr>`;
   }
 }
 
@@ -293,7 +319,11 @@ function setupCanvas(canvas) {
 function drawLogChart(samples, cycles) {
   const canvas = $("#log-chart");
   const [ctx, W, H] = setupCanvas(canvas);
-  const padL = 46, padR = 10, padT = 12, padB = 26;
+  let cellPresent = false, cellMaxN = 0;
+  for (const p of samples) {
+    if (p[4]) { cellPresent = true; cellMaxN = Math.max(cellMaxN, p[4].length); }
+  }
+  const padL = 46, padR = cellPresent ? 44 : 10, padT = 12, padB = 26;
   const iw = W - padL - padR, ih = H - padT - padB;
   if (!samples.length) return;
 
@@ -324,6 +354,16 @@ function drawLogChart(samples, cycles) {
       ? "rgba(77,163,255,0.08)" : "rgba(52,201,142,0.08)";
     ctx.fillRect(x(c.start_t), padT, Math.max(x(c.end_t) - x(c.start_t), 1), ih);
   }
+  // 单体失衡持续超差区间高亮（红色竖带）
+  let hasAlarmBand = false;
+  for (const c of cycles) {
+    for (const iv of (c.cell_intervals || [])) {
+      hasAlarmBand = true;
+      ctx.fillStyle = "rgba(239,83,80,0.18)";
+      ctx.fillRect(x(iv.start_t), padT,
+        Math.max(x(iv.end_t) - x(iv.start_t), 1), ih);
+    }
+  }
   // 网格与电压刻度
   ctx.strokeStyle = "#2a3550";
   ctx.fillStyle = "#8a97b5";
@@ -353,12 +393,64 @@ function drawLogChart(samples, cycles) {
     });
     ctx.stroke();
   }
+
+  // 单体电压曲线（共用一套单体电压刻度；缺值行断开，不跨点连线）
+  const CELL_COLORS = ["#b388ff", "#80cbc4", "#ffb74d", "#f06292",
+    "#aed581", "#4dd0e1", "#ff8a65", "#9fa8da", "#c5e1a5", "#ffd54f",
+    "#ce93d8", "#81d4fa"];
+  const cellN = cellMaxN;
+  let cellRange = null;
+  if (cellN) {
+    let mn = Infinity, mx = -Infinity;
+    for (const p of samples) {
+      if (!p[4]) continue;
+      for (const cv of p[4]) {
+        if (cv < mn) mn = cv;
+        if (cv > mx) mx = cv;
+      }
+    }
+    if (mx - mn < 1e-6) { mx += 0.5; mn -= 0.5; }
+    const pad = (mx - mn) * 0.15;
+    mn -= pad; mx += pad;
+    const yCell = (cv) => padT + ih - ((cv - mn) / (mx - mn)) * ih;
+    // 右轴：单体电压刻度
+    ctx.fillStyle = "#b388ff";
+    for (let g = 0; g <= 4; g++) {
+      const gy = padT + (ih * g) / 4;
+      const cv = mx - ((mx - mn) * g) / 4;
+      ctx.fillText(cv.toFixed(2) + "V", W - padR + 4, gy + 3);
+    }
+    ctx.fillStyle = "#8a97b5";
+    for (let k = 0; k < cellN; k++) {
+      ctx.strokeStyle = CELL_COLORS[k % CELL_COLORS.length];
+      ctx.lineWidth = 0.9;
+      ctx.beginPath();
+      let pen = false;
+      for (const p of samples) {
+        if (!p[4] || p[4].length !== cellN || p[4][k] === null) { pen = false; continue; }
+        const px = x(p[0]), py = yCell(p[4][k]);
+        pen ? ctx.lineTo(px, py) : ctx.moveTo(px, py);
+        pen = true;
+      }
+      ctx.stroke();
+    }
+    cellRange = { min: mn, max: mx, n: cellN };
+  }
   $("#chart-legend").innerHTML =
     series.map((s) =>
       `<span><span class="dot" style="background:${s.color}"></span>${s.name}
        （${s.min.toFixed(1)} ~ ${s.max.toFixed(1)}）</span>`).join("") +
     `<span>底色：<span class="dot" style="background:rgba(77,163,255,.4)"></span>放电循环
-     <span class="dot" style="background:rgba(52,201,142,.4)"></span>充电循环</span>`;
+     <span class="dot" style="background:rgba(52,201,142,.4)"></span>充电循环</span>` +
+    (hasAlarmBand
+      ? `<span><span class="dot" style="background:rgba(239,83,80,.55)"></span>单体压差持续超差区间（&gt;0.10V 且 ≥5s）</span>`
+      : "") +
+    (cellRange
+      ? `<span>单体电压 ${cellRange.n} 节（${cellRange.min.toFixed(2)} ~ ${cellRange.max.toFixed(2)}V，刻度见右轴）：` +
+        Array.from({ length: cellRange.n }, (_, k) =>
+          `<span class="dot" style="background:${CELL_COLORS[k % CELL_COLORS.length]}"></span>#${k + 1}`).join(" ") +
+        "</span>"
+      : "");
 }
 
 function drawTrend(trend, ratedAh) {

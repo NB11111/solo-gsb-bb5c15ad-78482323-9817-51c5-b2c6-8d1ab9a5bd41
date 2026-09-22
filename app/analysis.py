@@ -4,6 +4,7 @@
 - 梯形库仑积分估算每循环容量与能量
 - 利用负载切换时刻的电压跳变与静置段电压恢复估算直流内阻
 - 依据额定容量、安全电压范围与温度阈值生成可解释的判定标记
+- 可选单体电压：按时间连续性计算每循环最大压差与持续超差区间（>0.10V 达 5s）
 """
 from __future__ import annotations
 
@@ -23,12 +24,19 @@ TEMP_RISE_WARN_C = 15.0      # 单循环温升告警 (°C)
 VOLT_MARGIN_V = 0.02         # 电压越限判定余量 (V)
 OVER_CAPACITY_RATIO = 1.10   # 放电容量超过额定该比例时提示额定容量可能偏低
 
+# ---- 单体失衡判定阈值 ----
+CELL_DIFF_WARN_V = 0.10      # 单体最大压差超过该值视为超差 (V)
+CELL_SUSTAIN_MIN_S = 5.0     # 压差连续超差达该时长才生成失衡标记 (s)
+CELL_GAP_BREAK_S = 2.0       # 相邻单体采样时间差超过该值则中断连续区间 (s)
+CELL_EVIDENCE_POINTS = 5     # 每段告警区间保留的证据样本点数
+
 
 class Sample(NamedTuple):
     t: float      # 相对日志起点的秒
     v: float      # 电压 V
     i: float      # 电流 A，正=放电，负=充电
     temp: float   # 温度 °C
+    cells: Optional[tuple] = None  # 各单体电压 V；该行缺值/单体数漂移时为 None
 
 
 @dataclass
@@ -47,16 +55,31 @@ class Cycle:
     temp_rise_c: float
     ir_mohm: Optional[float]
     closed: bool
+    cell_count: int = 0          # 该循环内可用单体采样的单体数（0=无单体数据）
+    cell_max_diff_v: Optional[float] = None  # 循环内单体最大压差 V
+    cell_sustain_s: float = 0.0  # 连续超差（满足时长）区间累计持续 s
+    cell_intervals: list = field(default_factory=list)  # 持续超差区间与证据
     flags: list = field(default_factory=list)
 
     def to_dict(self) -> dict:
         d = asdict(self)
         for k in ("start_t", "end_t", "duration_s", "capacity_ah", "energy_wh",
                   "avg_current_a", "min_voltage", "max_voltage", "max_temp_c",
-                  "temp_rise_c"):
+                  "temp_rise_c", "cell_sustain_s"):
             d[k] = round(d[k], 4)
         if d["ir_mohm"] is not None:
             d["ir_mohm"] = round(d["ir_mohm"], 2)
+        if d["cell_max_diff_v"] is not None:
+            d["cell_max_diff_v"] = round(d["cell_max_diff_v"], 4)
+        for iv in d["cell_intervals"]:
+            iv["start_t"] = round(iv["start_t"], 3)
+            iv["end_t"] = round(iv["end_t"], 3)
+            iv["duration_s"] = round(iv["duration_s"], 3)
+            iv["max_diff_v"] = round(iv["max_diff_v"], 4)
+            iv["peak_t"] = round(iv["peak_t"], 3)
+            for ev in iv["evidence"]:
+                ev["t"] = round(ev["t"], 3)
+                ev["diff_v"] = round(ev["diff_v"], 4)
         return d
 
 
@@ -187,6 +210,103 @@ def _build_cycle(samples: list[Sample], a: int, b: int,
     )
 
 
+def _cell_stats(samples: list[Sample], a: int, b: int) -> dict:
+    """按时间连续性统计循环 [a, b] 内单体压差。
+
+    - 仅使用带有效单体数据的样本（缺值/单体数漂移的样本跳过单体分析）；
+    - 每点压差 = max(cell) - min(cell)；
+    - 采样间隔按时间戳累计；相邻有效单体样本间隔 > CELL_GAP_BREAK_S 中断连续区间；
+    - 只有压差连续超过 CELL_DIFF_WARN_V 达 CELL_SUSTAIN_MIN_S 才计入告警区间。
+    """
+    pts = [(samples[k].t, samples[k].cells)
+           for k in range(a, b + 1) if samples[k].cells]
+    result = {"cell_count": 0, "max_diff": None, "sustain_s": 0.0,
+              "intervals": []}
+    if len(pts) < 2:
+        return result
+
+    cell_n = len(pts[0][1])
+    diffs: list[tuple[float, float, tuple]] = []  # (t, diff, cells)
+    max_diff = 0.0
+    for t, cells in pts:
+        if len(cells) != cell_n:
+            continue  # 单体数量漂移的行：跳过该行单体分析
+        diff = max(cells) - min(cells)
+        diffs.append((t, diff, cells))
+        if diff > max_diff:
+            max_diff = diff
+    result["cell_count"] = cell_n
+    result["max_diff"] = max_diff
+
+    intervals: list[dict] = []
+    run: list[tuple] = []          # 当前连续超差样本
+    prev_t: Optional[float] = None
+
+    def close_run() -> None:
+        if not run:
+            return
+        r0, rn = run[0], run[-1]
+        dur = rn[0] - r0[0]
+        if dur >= CELL_SUSTAIN_MIN_S:
+            peak = max(run, key=lambda p: p[1])
+            peak_t, peak_diff, peak_cells = peak
+            weak = peak_cells.index(min(peak_cells)) + 1
+            strong = peak_cells.index(max(peak_cells)) + 1
+            # 证据片段：首、尾、峰值及中间点，最多 CELL_EVIDENCE_POINTS 个
+            idxs = sorted(set([
+                0, len(run) - 1,
+                *[int(k * (len(run) - 1) / (CELL_EVIDENCE_POINTS - 1))
+                  for k in range(CELL_EVIDENCE_POINTS)],
+            ]))
+            evidence = [{"t": round(run[k][0], 3),
+                         "diff_v": round(run[k][1], 4),
+                         "min_cell": run[k][2].index(min(run[k][2])) + 1,
+                         "max_cell": run[k][2].index(max(run[k][2])) + 1}
+                        for k in idxs]
+            intervals.append({
+                "start_t": r0[0], "end_t": rn[0], "duration_s": dur,
+                "max_diff_v": peak_diff, "peak_t": peak_t,
+                "weak_cell": weak, "strong_cell": strong,
+                "cell_count": cell_n, "evidence": evidence,
+            })
+
+    for t, diff, cells in diffs:
+        if diff > CELL_DIFF_WARN_V:
+            if run and (t - prev_t) > CELL_GAP_BREAK_S:
+                close_run()
+                run = []
+            run.append((t, diff, cells))
+        else:
+            close_run()
+            run = []
+        prev_t = t
+    close_run()
+
+    intervals.sort(key=lambda iv: -iv["max_diff_v"])
+    result["sustain_s"] = sum(iv["duration_s"] for iv in intervals)
+    result["intervals"] = intervals
+    return result
+
+
+def evaluate_cell_balance(cyc: Cycle) -> list[dict]:
+    """对单个循环生成单体失衡标记（无单体数据或不满足持续时长则不告警）。"""
+    if not cyc.cell_intervals:
+        return []
+    worst = max(cyc.cell_intervals, key=lambda iv: iv["max_diff_v"])
+    where = f"日志内第 {cyc.seq} 段（{'放电' if cyc.kind == 'discharge' else '充电'}）"
+    return [{
+        "code": "CELL_IMBALANCE", "severity": "warning",
+        "message": f"{where}单体最大压差 {worst['max_diff_v']:.3f}V（"
+                   f"第 {worst['weak_cell']} 节偏低 / 第 {worst['strong_cell']} 节偏高），"
+                   f"连续超过 {CELL_DIFF_WARN_V:.2f}V 达 {worst['duration_s']:.1f}s，"
+                   f"存在单体失衡。",
+        "evidence": (f"max_diff={worst['max_diff_v']:.3f}V"
+                     f" > {CELL_DIFF_WARN_V:.2f}V, duration={worst['duration_s']:.1f}s"
+                     f" >= {CELL_SUSTAIN_MIN_S:.0f}s, t={worst['start_t']:.0f}"
+                     f"~{worst['end_t']:.0f}s, cell#{worst['weak_cell']} lowest"),
+    }]
+
+
 def detect_cycles(samples: list[Sample],
                   min_cycle_s: float = MIN_CYCLE_S,
                   min_rest_s: float = MIN_REST_S,
@@ -206,6 +326,11 @@ def detect_cycles(samples: list[Sample],
         cyc = _build_cycle(samples, a, b, kind, thr)
         cyc.seq = len(cycles) + 1
         cyc.closed = si < len(segs) - 1   # 日志结束时仍处于充/放电 -> 未闭合
+        cell = _cell_stats(samples, a, b)  # 单体分析独立于总压状态机，失败不影响主结果
+        cyc.cell_count = cell["cell_count"]
+        cyc.cell_max_diff_v = cell["max_diff"]
+        cyc.cell_sustain_s = cell["sustain_s"]
+        cyc.cell_intervals = cell["intervals"]
         cycles.append(cyc)
     return cycles
 
@@ -331,6 +456,13 @@ def build_assessment(battery: dict, cycles: list[dict], log_count: int) -> dict:
     avg_ir = sum(irs) / len(irs) if irs else None
     max_temp = max((c["max_temp_c"] for c in cycles), default=None)
 
+    # 单体失衡汇总（仅有单体数据的循环参与）
+    cell_cycles = [c for c in cycles if c.get("cell_max_diff_v") is not None]
+    cell_worst = max((c["cell_max_diff_v"] for c in cell_cycles), default=None)
+    cell_imbalanced = sum(1 for c in cell_cycles
+                          if any(f["code"] == "CELL_IMBALANCE" for f in c["flags"]))
+    cell_count = max((c.get("cell_count", 0) for c in cell_cycles), default=0)
+
     # 4) 健康等级
     rank = {"info": 0, "warning": 1, "critical": 2}
     worst = max((rank.get(f["severity"], 0) for f in flags), default=0)
@@ -348,7 +480,10 @@ def build_assessment(battery: dict, cycles: list[dict], log_count: int) -> dict:
     trend = [{"n": i + 1, "capacity_ah": round(c["capacity_ah"], 4),
               "log_id": c["log_id"], "cycle_seq": c["seq"],
               "start_iso": c.get("start_iso"), "ir_mohm": c.get("ir_mohm"),
-              "max_temp_c": c["max_temp_c"]}
+              "max_temp_c": c["max_temp_c"],
+              "cell_max_diff_v": (round(c["cell_max_diff_v"], 4)
+                                  if c.get("cell_max_diff_v") is not None else None),
+              "cell_sustain_s": round(c.get("cell_sustain_s", 0.0), 3)}
              for i, c in enumerate(dis)]
 
     parts = [
@@ -364,6 +499,10 @@ def build_assessment(battery: dict, cycles: list[dict], log_count: int) -> dict:
         parts.append(f"平均估算内阻 {avg_ir:.1f}mΩ。")
     if max_temp is not None:
         parts.append(f"历史最高温度 {max_temp:.1f}°C。")
+    if cell_cycles:
+        parts.append(
+            f"单体电压（{cell_count} 节）覆盖 {len(cell_cycles)} 个循环，"
+            f"最大压差 {cell_worst:.3f}V，持续超差告警循环 {cell_imbalanced} 个。")
     n_crit = sum(1 for f in flags if f["severity"] == "critical")
     n_warn = sum(1 for f in flags if f["severity"] == "warning")
     parts.append(f"判定标记：严重 {n_crit} 条、警告 {n_warn} 条；综合健康等级：{GRADE_LABELS[grade]}。")
@@ -382,6 +521,13 @@ def build_assessment(battery: dict, cycles: list[dict], log_count: int) -> dict:
             "fade_per_cycle_percent": round(fade_rate, 3),
             "avg_ir_mohm": round(avg_ir, 2) if avg_ir is not None else None,
             "max_temp_c": max_temp,
+            "cell_count": cell_count,
+            "cell_monitored_cycles": len(cell_cycles),
+            "cell_imbalance_cycles": cell_imbalanced,
+            "cell_worst_diff_v": round(cell_worst, 4)
+            if cell_worst is not None else None,
+            "cell_diff_warn_v": CELL_DIFF_WARN_V,
+            "cell_sustain_min_s": CELL_SUSTAIN_MIN_S,
             "health_grade": grade,
             "health_label": GRADE_LABELS[grade],
         },

@@ -29,7 +29,8 @@ CREATE TABLE IF NOT EXISTS logs (
     max_current_a REAL,
     min_voltage   REAL,
     max_voltage   REAL,
-    max_temp_c    REAL
+    max_temp_c    REAL,
+    cell_info     TEXT
 );
 
 CREATE TABLE IF NOT EXISTS samples (
@@ -38,7 +39,8 @@ CREATE TABLE IF NOT EXISTS samples (
     t           REAL NOT NULL,
     voltage     REAL NOT NULL,
     current     REAL NOT NULL,
-    temperature REAL NOT NULL
+    temperature REAL NOT NULL,
+    cells       TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_samples_log ON samples(log_id, t);
 
@@ -61,10 +63,28 @@ CREATE TABLE IF NOT EXISTS cycles (
     temp_rise_c    REAL,
     ir_mohm        REAL,
     closed         INTEGER NOT NULL DEFAULT 1,
-    flags          TEXT NOT NULL DEFAULT '[]'
+    flags          TEXT NOT NULL DEFAULT '[]',
+    cell_count     INTEGER NOT NULL DEFAULT 0,
+    cell_max_diff_v REAL,
+    cell_sustain_s REAL NOT NULL DEFAULT 0,
+    cell_intervals TEXT NOT NULL DEFAULT '[]'
 );
 CREATE INDEX IF NOT EXISTS idx_cycles_battery ON cycles(battery_id, id);
 """
+
+# 旧版数据库补列（SQLite 不支持 CREATE TABLE IF 里的 ADD COLUMN，逐项 ALTER）
+_MIGRATIONS = [
+    ("logs", "cell_info", "ALTER TABLE logs ADD COLUMN cell_info TEXT"),
+    ("samples", "cells", "ALTER TABLE samples ADD COLUMN cells TEXT"),
+    ("cycles", "cell_count",
+     "ALTER TABLE cycles ADD COLUMN cell_count INTEGER NOT NULL DEFAULT 0"),
+    ("cycles", "cell_max_diff_v",
+     "ALTER TABLE cycles ADD COLUMN cell_max_diff_v REAL"),
+    ("cycles", "cell_sustain_s",
+     "ALTER TABLE cycles ADD COLUMN cell_sustain_s REAL NOT NULL DEFAULT 0"),
+    ("cycles", "cell_intervals",
+     "ALTER TABLE cycles ADD COLUMN cell_intervals TEXT NOT NULL DEFAULT '[]'"),
+]
 
 
 def get_conn() -> sqlite3.Connection:
@@ -75,11 +95,16 @@ def get_conn() -> sqlite3.Connection:
 
 
 def init_db() -> None:
-    """启动时调用：确保数据目录存在并建表。"""
+    """启动时调用：确保数据目录存在、建表，并为旧库补齐单体分析列。"""
     Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     try:
         conn.executescript(SCHEMA)
+        for table, column, ddl in _MIGRATIONS:
+            cols = {r[1] for r in conn.execute(
+                f"PRAGMA table_info({table})").fetchall()}
+            if column not in cols:
+                conn.execute(ddl)
         conn.commit()
     finally:
         conn.close()

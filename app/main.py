@@ -12,7 +12,8 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from urllib.parse import quote
 
-from .analysis import build_assessment, detect_cycles, evaluate_cycle
+from .analysis import (build_assessment, detect_cycles, evaluate_cycle,
+                       evaluate_cell_balance)
 from .database import get_conn, init_db
 from .importer import CsvFormatError, decode_text, parse_flight_csv
 
@@ -158,19 +159,23 @@ def import_log(bid: int, file: UploadFile = File(...)):
             cyc.flags = evaluate_cycle(
                 cyc, battery["rated_capacity_ah"],
                 battery["safe_voltage_min"], battery["safe_voltage_max"])
+            cyc.flags += evaluate_cell_balance(cyc)
 
         cur = conn.execute(
             "INSERT INTO logs(battery_id, filename, imported_at, start_time,"
             " duration_s, row_count, max_current_a, min_voltage, max_voltage,"
-            " max_temp_c) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            " max_temp_c, cell_info) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
             (bid, file.filename or "upload.csv", _now_iso(), meta["start_time"],
              meta["duration_s"], meta["row_count"], meta["max_current_a"],
-             meta["min_voltage"], meta["max_voltage"], meta["max_temp_c"]))
+             meta["min_voltage"], meta["max_voltage"], meta["max_temp_c"],
+             json.dumps(meta["cells"], ensure_ascii=False)))
         log_id = cur.lastrowid
         conn.executemany(
-            "INSERT INTO samples(log_id, t, voltage, current, temperature)"
-            " VALUES(?,?,?,?,?)",
-            [(log_id, s.t, s.v, s.i, s.temp) for s in samples])
+            "INSERT INTO samples(log_id, t, voltage, current, temperature, cells)"
+            " VALUES(?,?,?,?,?,?)",
+            [(log_id, s.t, s.v, s.i, s.temp,
+              json.dumps(list(s.cells)) if s.cells is not None else None)
+             for s in samples])
         start_epoch = None
         if meta["start_time"]:
             start_epoch = datetime.fromisoformat(
@@ -183,18 +188,22 @@ def import_log(bid: int, file: UploadFile = File(...)):
                 "INSERT INTO cycles(log_id, battery_id, seq, kind, start_t,"
                 " end_t, start_iso, duration_s, capacity_ah, energy_wh,"
                 " avg_current_a, min_voltage, max_voltage, max_temp_c,"
-                " temp_rise_c, ir_mohm, closed, flags)"
-                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                " temp_rise_c, ir_mohm, closed, flags, cell_count,"
+                " cell_max_diff_v, cell_sustain_s, cell_intervals)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (log_id, bid, cyc.seq, cyc.kind, cyc.start_t, cyc.end_t,
                  start_iso, cyc.duration_s, cyc.capacity_ah, cyc.energy_wh,
                  cyc.avg_current_a, cyc.min_voltage, cyc.max_voltage,
                  cyc.max_temp_c, cyc.temp_rise_c, cyc.ir_mohm,
                  1 if cyc.closed else 0, json.dumps(cyc.flags,
-                                                    ensure_ascii=False)))
+                                                    ensure_ascii=False),
+                 cyc.cell_count, cyc.cell_max_diff_v, cyc.cell_sustain_s,
+                 json.dumps(cyc.cell_intervals, ensure_ascii=False)))
         conn.commit()
         log = dict(conn.execute("SELECT * FROM logs WHERE id=?",
                                 (log_id,)).fetchone())
         return {"log": log, "skipped_rows": meta["skipped_rows"],
+                "cells": meta["cells"],
                 "cycles": [c.to_dict() for c in cycles]}
     finally:
         conn.close()
@@ -225,10 +234,11 @@ def get_log(log_id: int, max_points: int = 3000):
         if log is None:
             raise HTTPException(404, f"日志 {log_id} 不存在")
         rows = conn.execute(
-            "SELECT t, voltage, current, temperature FROM samples"
+            "SELECT t, voltage, current, temperature, cells FROM samples"
             " WHERE log_id=? ORDER BY t", (log_id,)).fetchall()
         stride = max(1, len(rows) // max_points + (1 if len(rows) % max_points else 0))
-        samples = [[round(r["t"], 2), r["voltage"], r["current"], r["temperature"]]
+        samples = [[round(r["t"], 2), r["voltage"], r["current"], r["temperature"],
+                    json.loads(r["cells"]) if r["cells"] else None]
                    for r in rows[::stride]]
         cycles = [dict(r) for r in conn.execute(
             "SELECT * FROM cycles WHERE log_id=? ORDER BY seq",
@@ -236,7 +246,11 @@ def get_log(log_id: int, max_points: int = 3000):
         for c in cycles:
             c["flags"] = json.loads(c["flags"])
             c["closed"] = bool(c["closed"])
-        return {"log": dict(log), "samples": samples, "cycles": cycles}
+            c["cell_intervals"] = json.loads(c["cell_intervals"])
+        log_dict = dict(log)
+        log_dict["cell_info"] = (json.loads(log_dict["cell_info"])
+                                 if log_dict["cell_info"] else None)
+        return {"log": log_dict, "samples": samples, "cycles": cycles}
     finally:
         conn.close()
 
@@ -264,6 +278,7 @@ def _build_battery_assessment(conn, bid: int) -> dict:
         c = dict(r)
         c["flags"] = json.loads(c["flags"])
         c["closed"] = bool(c["closed"])
+        c["cell_intervals"] = json.loads(c["cell_intervals"])
         cycles.append(c)
     log_count = conn.execute(
         "SELECT COUNT(*) AS n FROM logs WHERE battery_id=?", (bid,)).fetchone()["n"]

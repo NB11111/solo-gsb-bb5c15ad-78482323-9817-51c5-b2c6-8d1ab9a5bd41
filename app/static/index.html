@@ -55,7 +55,9 @@
           <button id="btn-upload">上传并分析</button>
         </div>
         <p class="muted">CSV 需包含表头与四列：时间（ISO 时间戳或秒）、电压 V、电流 A（放电为正）、温度 °C。
-        支持常见中英文列名与逗号/分号/制表符分隔。</p>
+        支持常见中英文列名与逗号/分号/制表符分隔。可选单体电压列 <code>cell1_voltage,cell2_voltage…</code>
+        （亦接受 <code>单体1电压 / 电芯电压1 / 第1节电压 / v1</code> 等表头），编号须从 1 连续；
+        某行缺值或单体数漂移时仅跳过该行单体分析，不影响总压循环分析。</p>
         <p id="upload-result" class="muted"></p>
       </div>
 
@@ -89,7 +91,8 @@
           <thead><tr>
             <th>#</th><th>类型</th><th>开始</th><th>时长</th><th>容量 (Ah)</th>
             <th>能量 (Wh)</th><th>均流 (A)</th><th>电压范围 (V)</th>
-            <th>最高温 (°C)</th><th>温升 (°C)</th><th>内阻 (mΩ)</th><th>状态</th>
+            <th>最高温 (°C)</th><th>温升 (°C)</th><th>内阻 (mΩ)</th>
+            <th>单体压差</th><th>状态</th>
           </tr></thead>
           <tbody></tbody>
         </table>
